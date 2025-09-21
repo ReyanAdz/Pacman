@@ -1,5 +1,5 @@
 {
-  "python.defaultInterpreterPath": "venv/bin/python",
-  "python.analysis.typeCheckingMode": "basic",
-  "editor.formatOnSave": true
+    "python.defaultInterpreterPath": "venv/bin/python",
+    "python.analysis.typeCheckingMode": "basic",
+    "editor.formatOnSave": true,
 }
