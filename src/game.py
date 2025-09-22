@@ -1,8 +1,14 @@
+import math
 import tkinter as tk
 from board import Board
 from ghost import RandomGhost, BFSGhost
 
 CELL = 24
+
+# timing
+TICK_MS = 16                   # ~60 ticks/sec
+PAC_SPEED = 120                # pixels per second (tune)
+GHOST_TICK_EVERY = 6           # ghost step interval (ticks)
 
 DIRS = {
     "Up":    (-1, 0),
@@ -12,38 +18,45 @@ DIRS = {
 }
 
 def dir_to_name(dr, dc):
-    """Convert a direction tuple to a string key for sprite images."""
-    if (dr, dc) == (-1, 0):
-        return "up"
-    elif (dr, dc) == (1, 0):
-        return "down"
-    elif (dr, dc) == (0, -1):
-        return "left"
-    elif (dr, dc) == (0, 1):
-        return "right"
-    else:
-        return "right"  # default facing
+    if (dr, dc) == (-1, 0): return "up"
+    if (dr, dc) == ( 1, 0): return "down"
+    if (dr, dc) == ( 0,-1): return "left"
+    if (dr, dc) == ( 0, 1): return "right"
+    return "right"
+
+def tile_center_px(r, c):
+    """Return the pixel coords (x,y) of the center of grid cell (r,c)."""
+    return (c * CELL + CELL // 2, r * CELL + CELL // 2)
+
+def same_tile(a, b):
+    return a[0] == b[0] and a[1] == b[1]
 
 class Game:
     def __init__(self, root):
         self.root = root
-        self.board = Board("maps/default_map.txt")
+        self.map_path = "maps/default_map.txt"
+        self.board = Board(self.map_path)
         self.rows, self.cols = self.board.height, self.board.width
+
         self.canvas = tk.Canvas(root, width=self.cols*CELL, height=self.rows*CELL, bg="black")
         self.canvas.pack()
-
-        # Make sure we get keyboard events
         self.canvas.focus_set()
         self.canvas.bind("<KeyPress>", self.handle_input)
         root.bind("<KeyPress>", self.handle_input)  # belt & suspenders
 
-        # --- Pac-Man ---
-        self.pacman_pos = list(self.board.player_start)   # (r, c)
-        self.pac_dir    = (0, 1)      # auto-move to the right initially
-        self.next_dir   = None        # buffered desired direction
-        self.pac_step_every = 5       # lower=faster; higher=slower
+        # --- Pac-Man state (grid + pixel) ---
+        self.pac_tile = list(self.board.player_start)   # [r, c]
+        self.pac_dir  = (0, 1)                          # current committed dir
+        self.next_dir = None                             # queued desired dir
 
-        # Pac-Man sprites (your pack uses files 1..3)
+        # pixel position at center of starting tile
+        cx, cy = tile_center_px(self.pac_tile[0], self.pac_tile[1])
+        self.pac_px, self.pac_py = float(cx), float(cy)
+
+        # target tile we are moving toward (None means idle)
+        self.pac_target = self._compute_next_target(self.pac_tile, self.pac_dir)
+
+        # --- Pac-Man sprites (your pack uses 1..3) ---
         from tkinter import PhotoImage
         self.pac_images = {
             "up": [
@@ -67,9 +80,10 @@ class Game:
                 PhotoImage(file="assets/pacman-right/3.png"),
             ]
         }
-        # Animation state
         self.pac_frame = 0
         self._last_facing = "right"
+        # chomp pacing: advance frame every N tile-centers reached (here: each center)
+        self._chomp_on_arrival = True
 
         # --- Ghost sprites ---
         self.ghost_images = {
@@ -77,52 +91,73 @@ class Game:
             "pinky":  PhotoImage(file="assets/ghosts/pinky.png"),
             "inky":   PhotoImage(file="assets/ghosts/inky.png"),
             "clyde":  PhotoImage(file="assets/ghosts/clyde.png"),
-            "blue":   PhotoImage(file="assets/ghosts/blue_ghost.png"),  # frightened mode
+            "blue":   PhotoImage(file="assets/ghosts/blue_ghost.png"),
         }
 
-        # --- Ghosts list ---
-        starts = self.board.ghost_starts or [(self.pacman_pos[0], max(1, self.pacman_pos[1]-3))]
-        # Pick up to four start positions (reuse first if not enough in the map)
-        start_a = starts[0]
-        start_b = starts[1] if len(starts) > 1 else starts[0]
-        start_c = starts[2] if len(starts) > 2 else starts[0]
-        start_d = starts[3] if len(starts) > 3 else starts[0]
+        # --- Ghosts ---
+        self.ghosts = self._build_ghosts()
+        self.ghost_step_every = GHOST_TICK_EVERY
+        self._ghost_timer = 0
 
-        self.ghosts = [
-            BFSGhost(start_a, image=self.ghost_images["blinky"], replan_every=6),
-            RandomGhost(start_b, image=self.ghost_images["pinky"]),
-            RandomGhost(start_c, image=self.ghost_images["inky"]),
-            RandomGhost(start_d, image=self.ghost_images["clyde"]),
-        ]
-        self.ghost_step_every = 6  # lower=faster; higher=slower
-
-        # timing
+        # timing / life
         self._tick = 0
         self._alive = True
 
-    # ---------------- Utils ----------------
-    def passable(self, r, c):
-        """True if (r,c) (with wrap) is not a wall."""
-        r2, c2 = r, c
-        # Horizontal wrap
-        if c2 < 0:            c2 = self.cols - 1
-        elif c2 >= self.cols: c2 = 0
-        # Vertical wrap (optional; keep or remove for your map)
-        if r2 < 0:            r2 = self.rows - 1
-        elif r2 >= self.rows: r2 = 0
-        return not self.board.is_wall(r2, c2)
+    # ---------------- Helpers ----------------
+    def _build_ghosts(self):
+        starts = self.board.ghost_starts or [(self.pac_tile[0], max(1, self.pac_tile[1]-3))]
+        a = starts[0]
+        b = starts[1] if len(starts) > 1 else starts[0]
+        c = starts[2] if len(starts) > 2 else starts[0]
+        d = starts[3] if len(starts) > 3 else starts[0]
+        return [
+            BFSGhost(a, image=self.ghost_images["blinky"], replan_every=6),
+            RandomGhost(b, image=self.ghost_images["pinky"]),
+            RandomGhost(c, image=self.ghost_images["inky"]),
+            RandomGhost(d, image=self.ghost_images["clyde"]),
+        ]
 
-    def step_pos(self, r, c, dr, dc):
-        """Advance one cell with wrap if not a wall; otherwise stay."""
-        nr, nc = r + dr, c + dc
-        # Wrap
-        if nc < 0:            nc = self.cols - 1
-        elif nc >= self.cols: nc = 0
-        if nr < 0:            nr = self.rows - 1
-        elif nr >= self.rows: nr = 0
-        if not self.board.is_wall(nr, nc):
-            return nr, nc
+    def reset_game(self):
+        self.board = Board(self.map_path)
+        self.rows, self.cols = self.board.height, self.board.width
+        self.pac_tile = list(self.board.player_start)
+        self.pac_dir  = (0, 1)
+        self.next_dir = None
+        cx, cy = tile_center_px(self.pac_tile[0], self.pac_tile[1])
+        self.pac_px, self.pac_py = float(cx), float(cy)
+        self.pac_target = self._compute_next_target(self.pac_tile, self.pac_dir)
+        self.pac_frame = 0
+        self._last_facing = "right"
+        self.ghosts = self._build_ghosts()
+        self._tick = 0
+        self._ghost_timer = 0
+        self._alive = True
+
+    def _wrap_tile(self, r, c):
+        if c < 0: c = self.cols - 1
+        elif c >= self.cols: c = 0
+        if r < 0: r = self.rows - 1
+        elif r >= self.rows: r = 0
         return r, c
+
+    def passable(self, r, c):
+        r, c = self._wrap_tile(r, c)
+        return not self.board.is_wall(r, c)
+
+    def _compute_next_target(self, tile_rc, direction):
+        """Return next target tile (r,c) from tile_rc moving 1 step in direction, or None if blocked."""
+        dr, dc = direction
+        if dr == 0 and dc == 0:
+            return None
+        tr, tc = self._wrap_tile(tile_rc[0] + dr, tile_rc[1] + dc)
+        if self.board.is_wall(tr, tc):
+            return None
+        return (tr, tc)
+
+    def _at_tile_center(self):
+        """True if Pac-Man's pixel position is (close to) the center of his current tile."""
+        cx, cy = tile_center_px(self.pac_tile[0], self.pac_tile[1])
+        return abs(self.pac_px - cx) < 0.5 and abs(self.pac_py - cy) < 0.5
 
     # ---------------- Lifecycle ----------------
     def start(self):
@@ -145,32 +180,35 @@ class Game:
             x, y = c*CELL + CELL//2, r*CELL + CELL//2
             self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="white", width=0)
 
-        # pacman (sprite)
-        pr, pc = self.pacman_pos
+        # pacman (sprite at pixel position)
         facing = dir_to_name(*self.pac_dir) if self.pac_dir != (0,0) else self._last_facing
-        self.pac_frame = (self.pac_frame + 1) % 3
         img = self.pac_images[facing][self.pac_frame]
         if self.pac_dir != (0,0):
             self._last_facing = facing
-        self.canvas.create_image(pc*CELL, pr*CELL, image=img, anchor="nw")
+        # convert pixel center to top-left for drawing
+        top_left_x = int(self.pac_px - CELL//2)
+        top_left_y = int(self.pac_py - CELL//2)
+        self.canvas.create_image(top_left_x, top_left_y, image=img, anchor="nw")
 
-        # ghosts
+        # ghosts (still tile-snapped; we can smooth later)
         for g in self.ghosts:
             gr, gc = g.pos
             gx0, gy0 = gc*CELL, gr*CELL
             if getattr(g, "image", None) is not None:
                 self.canvas.create_image(gx0, gy0, image=g.image, anchor="nw")
             else:
-                # fallback: draw as colored blob
                 self.canvas.create_oval(gx0+4, gy0+4, gx0+CELL-4, gy0+CELL-4, fill=g.color, width=0)
 
-        # game over overlay
         if not self._alive:
             cx, cy = self.cols*CELL//2, self.rows*CELL//2
-            self.canvas.create_text(cx, cy, text="GAME OVER", fill="red", font=("Arial", 28, "bold"))
+            self.canvas.create_text(cx, cy-16, text="GAME OVER", fill="red", font=("Arial", 28, "bold"))
+            self.canvas.create_text(cx, cy+16, text="Press R to Retry", fill="white", font=("Arial", 16, "bold"))
 
     # ---------------- Input ----------------
     def handle_input(self, event):
+        if not self._alive and (event.keysym.lower() == 'r'):
+            self.reset_game()
+            return
         if event.keysym in DIRS:
             self.next_dir = DIRS[event.keysym]
 
@@ -179,38 +217,60 @@ class Game:
         if self._alive:
             self._tick += 1
 
-            # --- PAC-MAN AUTO MOVE ---
-            if self._tick % self.pac_step_every == 0:
-                r, c = self.pacman_pos
+            # --- PAC-MAN MOVEMENT (smooth) ---
+            if self._at_tile_center():
+                r, c = self.pac_tile
 
-                # try to turn into next_dir if possible from current cell
+                # try to turn into next_dir if possible
                 if self.next_dir:
                     ndr, ndc = self.next_dir
                     if self.passable(r + ndr, c + ndc):
                         self.pac_dir = self.next_dir
 
-                # move one cell along current dir if possible
-                dr, dc = self.pac_dir
-                if dr != 0 or dc != 0:
-                    nr, nc = self.step_pos(r, c, dr, dc)
-                    self.pacman_pos = [nr, nc]
+                # recompute target
+                self.pac_target = self._compute_next_target(self.pac_tile, self.pac_dir)
+                if self.pac_target is None:
+                    self.pac_dir = (0, 0)
 
-                    # eat pellet
-                    if (nr, nc) in self.board.pellet_set:
-                        self.board.pellet_set.remove((nr, nc))
-                        self.board.pellets.remove((nr, nc))
+            if self.pac_target is not None and self.pac_dir != (0,0):
+                tx, ty = tile_center_px(self.pac_target[0], self.pac_target[1])
+                dx, dy = tx - self.pac_px, ty - self.pac_py
+                dist = math.hypot(dx, dy)
+                if dist > 0:
+                    step = PAC_SPEED * (TICK_MS / 1000.0)
+                    if step >= dist:
+                        # snap to target
+                        self.pac_px, self.pac_py = float(tx), float(ty)
+                        self.pac_tile = [self.pac_target[0], self.pac_target[1]]
+                        if self._chomp_on_arrival:
+                            self.pac_frame = (self.pac_frame + 1) % 3
+                        tr, tc = self.pac_tile
+                        if (tr, tc) in self.board.pellet_set:
+                            self.board.pellet_set.remove((tr, tc))
+                            self.board.pellets.remove((tr, tc))
+                        self.pac_target = self._compute_next_target(self.pac_tile, self.pac_dir)
+                        if self.pac_target is None:
+                            self.pac_dir = (0, 0)
+                    else:
+                        ux, uy = dx / dist, dy / dist
+                        self.pac_px += ux * step
+                        self.pac_py += uy * step
 
-            # --- GHOSTS ---
-            if self._tick % self.ghost_step_every == 0:
+            # --- GHOST MOVEMENT (timer-based) ---
+            self._ghost_timer += 1
+            if self._ghost_timer >= self.ghost_step_every:
                 for g in self.ghosts:
                     g.step(self)
+                    self.ghost_step_every = 12
+                self._ghost_timer = 0
 
-            # --- collision ---
-            pr, pc = self.pacman_pos
+            # --- COLLISION CHECK ---
+            pr, pc = self.pac_tile
             for g in self.ghosts:
                 if (pr, pc) == g.pos:
                     self._alive = False
                     break
 
         self.draw()
-        self.root.after(50, self.update)  # global tick rate (ms); tune with *_step_every
+        self.root.after(TICK_MS, self.update)
+

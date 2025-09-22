@@ -69,7 +69,7 @@ class BFSGhost(Ghost):
 
     def step(self, game) -> None:
         self._tick += 1
-        pac = tuple(game.pacman_pos)
+        pac = tuple(game.pac_tile)
         # Recompute path periodically or if empty
         if self._tick % self.replan_every == 0 or not self._path:
             self._path = self._bfs((self.r, self.c), pac, game.board)
